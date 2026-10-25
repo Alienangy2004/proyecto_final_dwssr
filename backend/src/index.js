@@ -28,72 +28,94 @@ const sseClients = new Set();
 function broadcastSSE(eventType, payload) {
   const message = `event: ${eventType}\ndata: ${JSON.stringify(payload)}\n\n`;
   for (const clientRes of sseClients) {
-    clientRes.write(message);
+    try {
+      clientRes.write(message);
+    } catch (err) {
+      sseClients.delete(clientRes);
+    }
   }
 }
 
-// 1. Conexión a MongoDB
+// 1. Conexión a MongoDB (con timeout reducido para evitar bloqueos si no está iniciado)
 mongoose
-  .connect(MONGO_URI)
-  .then(() => console.log('[MongoDB] Conectado exitosamente a:', MONGO_URI))
-  .catch((err) => console.error('[MongoDB] Error de conexión:', err));
+  .connect(MONGO_URI, { serverSelectionTimeoutMS: 2500 })
+  .then(() => console.log('✅ [MongoDB] Conectado exitosamente a:', MONGO_URI))
+  .catch((err) => console.warn('⚠️ [MongoDB] No se pudo conectar a Mongo local (opcional en simulaciones):', err.message));
 
 // 2. Conexión a Broker MQTT (Mosquitto)
 const mqttClient = mqtt.connect(MQTT_BROKER_URL, {
   clientId: `backend_express_${Math.random().toString(16).slice(2, 8)}`,
-  reconnectPeriod: 2000,
+  reconnectPeriod: 3000,
+  connectTimeout: 3000,
 });
 
 mqttClient.on('connect', () => {
-  console.log('[MQTT] Conectado a Mosquitto en:', MQTT_BROKER_URL);
+  console.log('✅ [MQTT] Conectado a Mosquitto en:', MQTT_BROKER_URL);
   mqttClient.subscribe(MQTT_TOPIC, { qos: 0 }, (err) => {
     if (err) {
-      console.error('[MQTT] Error al suscribirse:', err);
+      console.error('❌ [MQTT] Error al suscribirse:', err);
     } else {
-      console.log(`[MQTT] Suscrito al tópico: "${MQTT_TOPIC}"`);
+      console.log(`📡 [MQTT] Suscrito al tópico: "${MQTT_TOPIC}"`);
     }
   });
 });
 
+mqttClient.on('error', (err) => {
+  // Manejo silencioso de reconexión si Mosquitto no está activo
+});
+
+// Función central de procesamiento de telemetría y detección de anomalías
+async function processTelemetryPayload(rawPayload) {
+  const deviceId = rawPayload.deviceId || 'esp32-bomba-01';
+  const experimentRunId =
+    rawPayload.experimentRunId || runtimeConfig.experimentRunId;
+
+  const variables = {
+    current_a: Number(rawPayload.current_a ?? rawPayload.variables?.current_a ?? 0),
+    vibration_rms: Number(
+      rawPayload.vibration_rms ?? rawPayload.variables?.vibration_rms ?? 0
+    ),
+    temperature_c: Number(
+      rawPayload.temperature_c ?? rawPayload.variables?.temperature_c ?? 0
+    ),
+  };
+
+  // Ejecutar algoritmo de detección en JavaScript
+  const detectionResult = anomalyDetector.analyze(
+    deviceId,
+    variables,
+    runtimeConfig.algorithmUsed
+  );
+
+  let telemetryDoc = {
+    _id: new mongoose.Types.ObjectId().toString(),
+    timestamp: rawPayload.timestamp ? new Date(rawPayload.timestamp) : new Date(),
+    deviceId,
+    experimentRunId,
+    variables,
+    algorithmUsed: runtimeConfig.algorithmUsed,
+    detectionResult,
+  };
+
+  // Guardar registro en MongoDB si está disponible
+  if (mongoose.connection.readyState === 1) {
+    try {
+      telemetryDoc = await Telemetry.create(telemetryDoc);
+    } catch (error) {
+      console.warn('[MongoDB] Error guardando registro:', error.message);
+    }
+  }
+
+  // Despachar en tiempo real a todos los navegadores conectados vía SSE
+  broadcastSSE('telemetry', telemetryDoc);
+  return telemetryDoc;
+}
+
 mqttClient.on('message', async (topic, messageBuffer) => {
   if (topic !== MQTT_TOPIC) return;
-
   try {
     const rawPayload = JSON.parse(messageBuffer.toString());
-
-    const deviceId = rawPayload.deviceId || 'esp32-bomba-01';
-    const experimentRunId =
-      rawPayload.experimentRunId || runtimeConfig.experimentRunId;
-
-    const variables = {
-      current_a: Number(rawPayload.current_a ?? rawPayload.variables?.current_a ?? 0),
-      vibration_rms: Number(
-        rawPayload.vibration_rms ?? rawPayload.variables?.vibration_rms ?? 0
-      ),
-      temperature_c: Number(
-        rawPayload.temperature_c ?? rawPayload.variables?.temperature_c ?? 0
-      ),
-    };
-
-    // Ejecutar algoritmo de detección en JavaScript
-    const detectionResult = anomalyDetector.analyze(
-      deviceId,
-      variables,
-      runtimeConfig.algorithmUsed
-    );
-
-    // Guardar registro en MongoDB
-    const telemetryDoc = await Telemetry.create({
-      timestamp: rawPayload.timestamp ? new Date(rawPayload.timestamp) : new Date(),
-      deviceId,
-      experimentRunId,
-      variables,
-      algorithmUsed: runtimeConfig.algorithmUsed,
-      detectionResult,
-    });
-
-    // Despachar en tiempo real a todos los navegadores conectados vía SSE
-    broadcastSSE('telemetry', telemetryDoc);
+    await processTelemetryPayload(rawPayload);
   } catch (error) {
     console.error('[MQTT->Processor] Error procesando mensaje:', error.message);
   }
@@ -150,6 +172,9 @@ app.get('/api/estado', (req, res) => {
 
 app.get('/api/telemetry/history', async (req, res) => {
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.json([]);
+    }
     const { limit = 60, runId, onlyAnomalies } = req.query;
     const filter = {};
     if (runId) filter.experimentRunId = runId;
@@ -168,6 +193,15 @@ app.get('/api/telemetry/history', async (req, res) => {
 
 app.get('/api/stats', async (req, res) => {
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.json({
+        experimentRunId: runtimeConfig.experimentRunId,
+        totalSamples: 0,
+        anomalyCount: 0,
+        anomalyRatePercent: 0,
+        byAlgorithm: [],
+      });
+    }
     const { runId } = req.query;
     const matchStage = runId ? { experimentRunId: runId } : {};
 
@@ -234,8 +268,8 @@ app.post('/api/config', (req, res) => {
   res.json({ message: 'Configuración actualizada', config: runtimeConfig });
 });
 
-// Endpoint opcional para simular inyección de datos sin tener el ESP32 conectado
-app.post('/api/simulate', (req, res) => {
+// Endpoint para simular inyección de datos (funciona con o sin Mosquitto local activo)
+app.post('/api/simulate', async (req, res) => {
   const payload = {
     deviceId: req.body.deviceId || 'esp32-bomba-01',
     current_a: req.body.current_a ?? Number((1.15 + (Math.random() - 0.5) * 0.15).toFixed(3)),
@@ -244,8 +278,15 @@ app.post('/api/simulate', (req, res) => {
     temperature_c:
       req.body.temperature_c ?? Number((42.0 + (Math.random() - 0.5) * 0.6).toFixed(2)),
   };
-  mqttClient.publish(MQTT_TOPIC, JSON.stringify(payload));
-  res.json({ published: payload });
+
+  // Si Mosquitto está conectado, publicamos por MQTT; si no, procesamos directamente
+  if (mqttClient.connected) {
+    mqttClient.publish(MQTT_TOPIC, JSON.stringify(payload));
+  } else {
+    await processTelemetryPayload(payload);
+  }
+
+  res.json({ published: payload, mqttConnected: mqttClient.connected });
 });
 
 app.listen(PORT, () => {
