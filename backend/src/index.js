@@ -123,6 +123,31 @@ app.get('/api/stream', (req, res) => {
 });
 
 // 4. Endpoints REST para el Frontend
+app.get('/', (req, res) => {
+  res.json({
+    status: 'online',
+    servicio: 'Sistema de Monitoreo y Deteccion de Anomalias IoT',
+    endpointsDisponibles: [
+      '/api/estado',
+      '/api/config',
+      '/api/stats',
+      '/api/telemetry/history',
+      '/api/stream',
+      '/api/simulate',
+    ],
+  });
+});
+
+app.get('/api/estado', (req, res) => {
+  res.json({
+    status: 'ok',
+    mensaje: 'El servidor backend esta funcionando correctamente',
+    mongodb: mongoose.connection.readyState === 1 ? 'conectado' : 'desconectado',
+    mqtt: mqttClient.connected ? 'conectado' : 'desconectado',
+    runtimeConfig,
+  });
+});
+
 app.get('/api/telemetry/history', async (req, res) => {
   try {
     const { limit = 60, runId, onlyAnomalies } = req.query;
